@@ -10,11 +10,16 @@ def parse_do_not_replace(value):
         return []
     return [x.strip() for x in value.split(',') if x.strip()]
 
-def compare_metrics(sugg, replace, metric, direction):
-    if direction == 'higher':
-        return sugg > replace
-    else:
-        return sugg < replace
+def compare_metrics(sugg_val, replace_val, direction):
+    try:
+        if pd.isnull(sugg_val) or pd.isnull(replace_val):
+            return False
+        if direction == 'higher':
+            return sugg_val > replace_val
+        else:
+            return sugg_val < replace_val
+    except Exception as e:
+        return False
 
 # Metric definitions
 metric_info = {
@@ -38,6 +43,19 @@ uploaded_file = st.file_uploader("Upload the CSV file", type=["csv"])
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
+
+    required_columns = [
+        'Pickup Location', 'Dropoff Location', 'Type', 'Carrier Name', 'Shipment Volume',
+        'Tracking %', 'Avg Ping Frequency Mins', 'Milestone Completeness Percent',
+        'Origin Arrival Milestones Percent', 'Origin Departure Milestones Percent',
+        'Destination Arrival Milestones Percent', 'Destination Departure Milestones Percent',
+        'Pickup Arrival Within 30 Min Percent', 'Dropoff Arrival Within 30 Min Percent'
+    ]
+
+    missing_cols = [col for col in required_columns if col not in df.columns]
+    if missing_cols:
+        st.error(f"The uploaded file is missing these required columns: {', '.join(missing_cols)}")
+        st.stop()
 
     df = df[df['Type'] == 'Lane-Carrier']  # Only Lane-Carrier rows
     df['Lane'] = df['Pickup Location'] + ' -> ' + df['Dropoff Location']
