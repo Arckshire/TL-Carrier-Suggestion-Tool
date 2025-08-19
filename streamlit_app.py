@@ -127,7 +127,7 @@ if uploaded_file:
     if st.button("Generate Suggestions"):
         with st.spinner("Crunching suggestions..."):
             suggestions = []
-            lane_summary_rows = []  # NEW: to capture good/bad counts per lane
+            lane_summary_rows = []
 
             for lane in top_lanes:
                 lane_df = df[df['Lane'] == lane]
@@ -155,11 +155,9 @@ if uploaded_file:
                         if carrier not in do_not_replace:
                             bad_carriers.append(row)
                     else:
-                        # candidate good must also meet min volume if provided
                         if (row['Shipment Volume'] or 0) >= min_sugg_volume:
                             good_carriers.append(row)
 
-                # NEW: store per-lane counts for summary
                 total_carriers_lane = len(lane_df)
                 lane_summary_rows.append({
                     "Lane": lane,
@@ -178,7 +176,16 @@ if uploaded_file:
                             col = metric_info[metric]['col']
                             direction = metric_info[metric]['direction']
                             if compare_metrics(good[col], bad[col], direction):
-                                reasons.append(metric)
+                                # compute delta to show in reason
+                                if direction == 'higher':
+                                    delta = (good[col] - bad[col]) if (pd.notna(good[col]) and pd.notna(bad[col])) else np.nan
+                                else:
+                                    # lower is better: improvement = bad - good
+                                    delta = (bad[col] - good[col]) if (pd.notna(good[col]) and pd.notna(bad[col])) else np.nan
+                                if pd.notna(delta):
+                                    reasons.append(f"{metric} (+{round(float(delta), 1)})")
+                                else:
+                                    reasons.append(metric)
 
                         if reasons:
                             replacements.append((good, reasons))
@@ -200,7 +207,7 @@ if uploaded_file:
                             'Replaced Metrics': bad.drop(['Type', 'Pickup Location', 'Dropoff Location', 'Carrier Name', 'Lane']).to_dict(),
                         })
 
-        # === NEW: Lane Summary & Highest Good-Carrier Lane ===
+        # Lane Summary (kept)
         lane_summary_df = pd.DataFrame(lane_summary_rows).sort_values(
             by=["Good Carriers (meets thresholds)", "Total Carriers in Lane"],
             ascending=[False, False]
@@ -214,23 +221,42 @@ if uploaded_file:
             with st.expander("See Lane Summary (analyzed lanes)"):
                 st.dataframe(lane_summary_df, use_container_width=True)
 
-        # === Suggestions UI & Export ===
+        # Suggestions UI & Export
         if suggestions:
             out_df = pd.DataFrame(suggestions)
 
-            # Expand the dict columns to flat columns
+            # Expand Replaced Metrics to flat columns
             if 'Replaced Metrics' in out_df.columns:
                 replaced_expanded = pd.json_normalize(out_df['Replaced Metrics'])
                 replaced_expanded.columns = [f"Replaced | {c}" for c in replaced_expanded.columns]
                 out_df = pd.concat([out_df.drop(columns=['Replaced Metrics']), replaced_expanded], axis=1)
 
-            # Nice primary columns first
-            display_cols_first = [
-                'Lane', 'Suggested Carrier', 'Replaces', 'Reason', 'Shipment Volume',
-                'Tracking %', 'Milestone Completeness Percent', 'Avg Ping Frequency Mins'
-            ]
-            ordered_cols = [c for c in display_cols_first if c in out_df.columns] + \
-                           [c for c in out_df.columns if c not in display_cols_first]
+            # ---------------------------
+            # Dynamic column ordering (YOUR FINAL SPEC)
+            # A-D fixed: Lane, Suggested Carrier, Replaces, Reason
+            # E fixed: Shipment Volume (suggested)
+            # F fixed: Replaced | Shipment Volume
+            # Then for each selected metric: suggested col, then Replaced | col
+            # Then the rest of the columns in current order
+            # ---------------------------
+            base_fixed = ['Lane', 'Suggested Carrier', 'Replaces', 'Reason']
+            fixed_after = ['Shipment Volume', 'Replaced | Shipment Volume']
+
+            # Build metric pairs in selected order
+            metric_pairs = []
+            for m in selected_metrics:
+                col = metric_info[m]['col']
+                sugg_col = col
+                rep_col = f"Replaced | {col}"
+                if sugg_col in out_df.columns:
+                    metric_pairs.append(sugg_col)
+                if rep_col in out_df.columns:
+                    metric_pairs.append(rep_col)
+
+            already = set(base_fixed + fixed_after + metric_pairs)
+            remaining = [c for c in out_df.columns if c not in already]
+
+            ordered_cols = base_fixed + fixed_after + metric_pairs + remaining
             out_df = out_df[ordered_cols]
 
             st.success(f"✅ Generated {len(out_df):,} suggestions.")
@@ -243,16 +269,40 @@ if uploaded_file:
                                file_name="carrier_suggestions.csv",
                                mime="text/csv")
 
-            # Excel: Suggestions + Run_Parameters + Lane_Summary (NEW)
-            params = {
-                'Top N Lanes': [int(top_n_lanes)],
-                'Suggestions per Lane': [int(suggestions_per_lane)],
-                'Min Suggested Volume': [int(min_sugg_volume)],
-                'Do Not Replace': [", ".join(do_not_replace) if do_not_replace else "NA"],
-                'Selected Metrics': [", ".join(selected_metrics)],
-                'Thresholds': [", ".join(f"{m}:{metric_thresholds[m]}" for m in selected_metrics)]
-            }
-            params_df = pd.DataFrame(params)
+            # Excel download (Suggestions + Run_Parameters + Lane_Summary with definitions)
+            params_rows = [
+                {
+                    'Parameter': 'Top N Lanes',
+                    'Value': int(top_n_lanes),
+                    'Definition': 'Only these highest-volume lanes are analyzed for suggestions.'
+                },
+                {
+                    'Parameter': 'Suggestions per Lane',
+                    'Value': int(suggestions_per_lane),
+                    'Definition': 'Maximum number of suggested carriers to output per lane (ranked by suggested carrier volume).'
+                },
+                {
+                    'Parameter': 'Min Suggested Volume',
+                    'Value': int(min_sugg_volume),
+                    'Definition': 'Suggested carriers must have at least this many shipments in the lane to be considered.'
+                },
+                {
+                    'Parameter': 'Do Not Replace',
+                    'Value': ", ".join(do_not_replace) if do_not_replace else "NA",
+                    'Definition': 'Carriers listed here will not be considered for replacement even if they fail thresholds.'
+                },
+                {
+                    'Parameter': 'Selected Metrics',
+                    'Value': ", ".join(selected_metrics),
+                    'Definition': 'Metrics chosen to judge good/bad carriers and to compare suggested vs. replaced.'
+                },
+                {
+                    'Parameter': 'Thresholds',
+                    'Value': ", ".join(f"{m}:{metric_thresholds[m]}" for m in selected_metrics),
+                    'Definition': 'For each selected metric: Higher is better except Avg Ping Frequency Mins (lower is better).'
+                }
+            ]
+            params_df = pd.DataFrame(params_rows)
 
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
