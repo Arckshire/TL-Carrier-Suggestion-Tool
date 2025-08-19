@@ -128,6 +128,7 @@ if uploaded_file:
         with st.spinner("Crunching suggestions..."):
             suggestions = []
             lane_summary_rows = []
+            lane_detail_rows = []  # for Lane_Summary_Carriers sheet
 
             for lane in top_lanes:
                 lane_df = df[df['Lane'] == lane]
@@ -158,13 +159,41 @@ if uploaded_file:
                         if (row['Shipment Volume'] or 0) >= min_sugg_volume:
                             good_carriers.append(row)
 
+                # Detail rows (one per carrier with Good/Bad label)
+                for r in good_carriers:
+                    lane_detail_rows.append({
+                        "Lane": lane,
+                        "Category": "Good",
+                        "Carrier Name": r['Carrier Name'],
+                        "Shipment Volume": r.get('Shipment Volume'),
+                        "Tracking %": r.get('Tracking %'),
+                        "Milestone Completeness Percent": r.get('Milestone Completeness Percent'),
+                        "Avg Ping Frequency Mins": r.get('Avg Ping Frequency Mins')
+                    })
+                for r in bad_carriers:
+                    lane_detail_rows.append({
+                        "Lane": lane,
+                        "Category": "Bad",
+                        "Carrier Name": r['Carrier Name'],
+                        "Shipment Volume": r.get('Shipment Volume'),
+                        "Tracking %": r.get('Tracking %'),
+                        "Milestone Completeness Percent": r.get('Milestone Completeness Percent'),
+                        "Avg Ping Frequency Mins": r.get('Avg Ping Frequency Mins')
+                    })
+
+                # Prepare names for comments
+                good_names = [str(x['Carrier Name']) for _, x in pd.DataFrame(good_carriers).iterrows()] if len(good_carriers) else []
+                bad_names  = [str(x['Carrier Name']) for _, x in pd.DataFrame(bad_carriers).iterrows()] if len(bad_carriers) else []
+
                 total_carriers_lane = len(lane_df)
                 lane_summary_rows.append({
                     "Lane": lane,
                     "Good Carriers (meets thresholds)": len(good_carriers),
                     "Bad Carriers (fails thresholds)": len(bad_carriers),
                     "Total Carriers in Lane": total_carriers_lane,
-                    "Good Ratio": (len(good_carriers) / total_carriers_lane) if total_carriers_lane else np.nan
+                    "Good Ratio": (len(good_carriers) / total_carriers_lane) if total_carriers_lane else np.nan,
+                    "_good_names": good_names,   # hidden columns to drive comments
+                    "_bad_names": bad_names
                 })
 
                 # Build suggestions
@@ -208,18 +237,24 @@ if uploaded_file:
                         })
 
         # Lane Summary (kept)
-        lane_summary_df = pd.DataFrame(lane_summary_rows).sort_values(
-            by=["Good Carriers (meets thresholds)", "Total Carriers in Lane"],
-            ascending=[False, False]
-        )
+        lane_summary_df = pd.DataFrame(lane_summary_rows)
+
+        # Sort for display
         if not lane_summary_df.empty:
+            lane_summary_df = lane_summary_df.sort_values(
+                by=["Good Carriers (meets thresholds)", "Total Carriers in Lane"],
+                ascending=[False, False]
+            )
             top_lane_row = lane_summary_df.iloc[0]
             st.info(
                 f"🏆 **Highest good-carrier lane (from analyzed lanes):** "
                 f"**{top_lane_row['Lane']}** — **{int(top_lane_row['Good Carriers (meets thresholds)'])} good carrier(s)**"
             )
             with st.expander("See Lane Summary (analyzed lanes)"):
-                st.dataframe(lane_summary_df, use_container_width=True)
+                st.dataframe(
+                    lane_summary_df.drop(columns=['_good_names', '_bad_names']),
+                    use_container_width=True
+                )
 
         # Suggestions UI & Export
         if suggestions:
@@ -269,7 +304,7 @@ if uploaded_file:
                                file_name="carrier_suggestions.csv",
                                mime="text/csv")
 
-            # Excel download (Suggestions + Run_Parameters + Lane_Summary with definitions)
+            # Excel download (Suggestions + Run_Parameters + Lane_Summary + Lane_Summary_Carriers + Pivot)
             params_rows = [
                 {
                     'Parameter': 'Top N Lanes',
@@ -304,11 +339,101 @@ if uploaded_file:
             ]
             params_df = pd.DataFrame(params_rows)
 
+            # Build Lane_Summary_Carriers sheet
+            lane_detail_df = pd.DataFrame(lane_detail_rows) if lane_detail_rows else pd.DataFrame(
+                columns=["Lane","Category","Carrier Name","Shipment Volume","Tracking %","Milestone Completeness Percent","Avg Ping Frequency Mins"]
+            )
+
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+                # Write base sheets
                 out_df.to_excel(writer, sheet_name="Suggestions", index=False)
                 params_df.to_excel(writer, sheet_name="Run_Parameters", index=False)
-                lane_summary_df.to_excel(writer, sheet_name="Lane_Summary", index=False)
+                # Write lane summary (drop hidden lists)
+                lane_summary_export = lane_summary_df.drop(columns=['_good_names','_bad_names']) if not lane_summary_df.empty else lane_summary_df
+                lane_summary_export.to_excel(writer, sheet_name="Lane_Summary", index=False)
+                lane_detail_df.to_excel(writer, sheet_name="Lane_Summary_Carriers", index=False)
+
+                # Add comments with names to Lane_Summary counts
+                workbook  = writer.book
+                ws = writer.sheets.get("Lane_Summary")
+
+                if ws is not None and not lane_summary_df.empty:
+                    headers = list(lane_summary_export.columns)
+                    try:
+                        col_good = headers.index("Good Carriers (meets thresholds)")
+                        col_bad  = headers.index("Bad Carriers (fails thresholds)")
+                    except ValueError:
+                        col_good, col_bad = None, None
+
+                    for r_idx, row in lane_summary_df.reset_index(drop=True).iterrows():
+                        excel_row = r_idx + 1  # +1 for header
+                        if col_good is not None:
+                            good_names = row.get("_good_names", []) or []
+                            if good_names:
+                                txt = "Good carriers:\n" + "\n".join(good_names)
+                                if len(txt) > 3000:
+                                    txt = txt[:2990] + "\n… (truncated)"
+                                ws.write_comment(excel_row, col_good, txt, {'width': 240, 'height': 180})
+                        if col_bad is not None:
+                            bad_names = row.get("_bad_names", []) or []
+                            if bad_names:
+                                txt = "Bad carriers:\n" + "\n".join(bad_names)
+                                if len(txt) > 3000:
+                                    txt = txt[:2990] + "\n… (truncated)"
+                                ws.write_comment(excel_row, col_bad, txt, {'width': 240, 'height': 180})
+
+                # === NEW: Auto-build Pivot Table sheet (best-effort; skips if not supported) ===
+                try:
+                    from xlsxwriter.utility import xl_range
+
+                    pivot_ws = workbook.add_worksheet("Lane_Summary_Pivot")
+                    writer.sheets["Lane_Summary_Pivot"] = pivot_ws
+
+                    # Determine data range for the pivot: A1:LastColLastRow on Lane_Summary_Carriers
+                    detail_headers = list(lane_detail_df.columns)
+                    last_row = len(lane_detail_df) + 1  # include header
+                    last_col_idx = len(detail_headers) - 1  # zero-based
+                    # Build an A1-style range string: e.g., A1:G1024
+                    last_col_letter = chr(ord('A') + last_col_idx) if last_col_idx < 26 else None
+                    # For >26 columns (not our case), you'd need a converter. We keep it simple.
+
+                    data_range = f"Lane_Summary_Carriers!A1:{last_col_letter}{last_row}" if last_col_letter else xl_range(0,0,last_row-1,last_col_idx)
+
+                    # Configure the Pivot Table
+                    # Note: This requires XlsxWriter >= 3.0 for add_pivot_table()
+                    workbook.add_pivot_table({
+                        'data': data_range,
+                        'name': 'PivotLaneSummary',
+                        'worksheet': pivot_ws,
+                        'row_fields':   ['Carrier Name'],
+                        'column_fields':['Category'],
+                        'filter_fields':['Lane'],
+                        'data_fields': [
+                            {'name': 'Carrier Count', 'field': 'Carrier Name', 'function': 'count'},
+                            # Optional: include volume total by category per carrier
+                            # {'name': 'Total Volume', 'field': 'Shipment Volume', 'function': 'sum'},
+                        ],
+                        'row_header': True,
+                        'column_header': True,
+                        'insert_row': 2,     # start near A3
+                        'insert_col': 0,
+                        'banded_rows': True,
+                        'banded_columns': False
+                    })
+
+                    # Helpful title/notes
+                    title_fmt = workbook.add_format({'bold': True, 'font_size': 12})
+                    pivot_ws.write(0, 0, "Lane Summary — Pivot (filter by Lane to view Good/Bad carriers)", title_fmt)
+                    pivot_ws.write(1, 0, "Tip: Use the Lane filter (top-left of the pivot).", workbook.add_format({'italic': True}))
+                except Exception as e:
+                    # Gracefully skip pivot if xlsxwriter version doesn't support it
+                    note_ws = writer.sheets.get("Lane_Summary_Pivot")
+                    if note_ws is None:
+                        note_ws = workbook.add_worksheet("Lane_Summary_Pivot")
+                    note_ws.write(0, 0, "Pivot not generated (XlsxWriter version may not support pivots in this environment).")
+                    note_ws.write(1, 0, f"Detail data is available in 'Lane_Summary_Carriers'. Error: {str(e)[:200]}")
+
             st.download_button(
                 "Download Suggestions as Excel",
                 data=buffer.getvalue(),
